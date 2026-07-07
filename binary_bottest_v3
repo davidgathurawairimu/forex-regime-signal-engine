@@ -1,0 +1,480 @@
+"""
+Multi-Pair FX Scalping Engine — 3-Minute Pacing Edition
+======================================================
+Evaluates stable 1-minute candle structures, delivering high-confluence
+BUY and SELL alerts precisely every 3 minutes.
+"""
+
+import queue
+import threading
+import time
+import tkinter as tk
+from tkinter import ttk
+from datetime import datetime, timezone
+
+import numpy as np
+import pandas as pd
+
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None
+
+
+# =========================== CONFIG DEFAULTS ===========================
+PAIRS = {
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/JPY": "USDJPY=X",
+    "AUD/USD": "AUDUSD=X",
+    "USD/CAD": "USDCAD=X",
+    "USD/CHF": "USDCHF=X",
+    "NZD/USD": "NZDUSD=X",
+}
+DEFAULT_PAIR_LABEL = "EUR/USD"
+SYMBOL = PAIRS[DEFAULT_PAIR_LABEL]
+DEFAULT_CANDLE_INTERVAL = "1m"  # Switched to 1m for absolute network stability
+DEFAULT_LOOKBACK = "1d"         # 1-day historical depth is ideal for 1m indicators
+DEFAULT_POLL_SECONDS = 180      # 180 seconds = Engine executes strictly every 3 minutes
+MIN_VOTES = 4
+# =========================================================================
+
+
+# ----------------------------- Indicators -----------------------------
+
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def macd(series: pd.Series, fast=12, slow=26, signal=9):
+    macd_line = ema(series, fast) - ema(series, slow)
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+
+def bollinger_bands(series: pd.Series, period=20, num_std=2):
+    mid = series.rolling(period).mean()
+    std = series.rolling(period).std()
+    return mid + num_std * std, mid, mid - num_std * std
+
+
+def stochastic(df: pd.DataFrame, k_period=14, d_period=3):
+    low_min = df["low"].rolling(k_period).min()
+    high_max = df["high"].rolling(k_period).max()
+    k = 100 * (df["close"] - low_min) / (high_max - low_min)
+    d = k.rolling(d_period).mean()
+    return k, d
+
+
+def atr(df: pd.DataFrame, period=14):
+    high_low = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift()).abs()
+    low_close = (df["low"] - df["close"].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+
+def adx_proxy(df: pd.DataFrame, period=14):
+    up_move = df["high"].diff()
+    down_move = -df["low"].diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    tr = atr(df, period)
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period).mean() / tr
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period).mean() / tr
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    return dx.ewm(alpha=1 / period).mean()
+
+
+def classify_regime(df: pd.DataFrame) -> str:
+    atr_series = atr(df)
+    adx_series = adx_proxy(df)
+    latest_atr = atr_series.iloc[-1]
+    avg_atr = atr_series.tail(30).mean()
+    latest_adx = adx_series.iloc[-1]
+
+    if pd.isna(latest_atr) or pd.isna(avg_atr) or pd.isna(latest_adx):
+        return "UNKNOWN"
+
+    high_vol = latest_atr > avg_atr * 1.4
+    trending = latest_adx > 22
+
+    if trending and not high_vol:
+        return "TRENDING"
+    if trending and high_vol:
+        return "VOLATILE_TREND"
+    if not trending and high_vol:
+        return "VOLATILE_CHOP"
+    return "RANGING_QUIET"
+
+
+def generate_votes(df: pd.DataFrame) -> dict:
+    close = df["close"]
+    votes = {}
+
+    # 1. EMA Cross Fast Momentum Filter
+    ema9, ema21 = ema(close, 9), ema(close, 21)
+    if ema9.iloc[-1] > ema21.iloc[-1]:
+        votes["EMA_Cross"] = "BUY"
+    else:
+        votes["EMA_Cross"] = "SELL"
+
+    # 2. RSI Scalping Thresholds
+    r = rsi(close).iloc[-1]
+    if r < 35:
+        votes["RSI"] = "BUY"
+    elif r > 65:
+        votes["RSI"] = "SELL"
+    else:
+        votes["RSI"] = "NEUTRAL"
+
+    # 3. MACD Histogram Trend Filter
+    _, _, hist = macd(close)
+    if hist.iloc[-1] > 0 and hist.iloc[-1] > hist.iloc[-2]:
+        votes["MACD"] = "BUY"
+    elif hist.iloc[-1] < 0 and hist.iloc[-1] < hist.iloc[-2]:
+        votes["MACD"] = "SELL"
+    else:
+        votes["MACD"] = "NEUTRAL"
+
+    # 4. Bollinger Bounds Reversion
+    upper, mid, lower = bollinger_bands(close)
+    price = close.iloc[-1]
+    if price <= lower.iloc[-1]:
+        votes["Bollinger"] = "BUY"
+    elif price >= upper.iloc[-1]:
+        votes["Bollinger"] = "SELL"
+    else:
+        votes["Bollinger"] = "NEUTRAL"
+
+    # 5. Stochastic Oscillator Momentum
+    k, d = stochastic(df)
+    if k.iloc[-1] < 20 and k.iloc[-1] > d.iloc[-1]:
+        votes["Stochastic"] = "BUY"
+    elif k.iloc[-1] > 80 and k.iloc[-1] < d.iloc[-1]:
+        votes["Stochastic"] = "SELL"
+    else:
+        votes["Stochastic"] = "NEUTRAL"
+
+    return votes
+
+
+def aggregate_signal(votes: dict, regime: str, min_votes: int = MIN_VOTES):
+    buy_votes = sum(1 for v in votes.values() if v == "BUY")
+    sell_votes = sum(1 for v in votes.values() if v == "SELL")
+    total = len(votes)
+
+    if regime == "VOLATILE_CHOP":
+        return "NO TRADE", 0, "Chop detected — Execution blocked."
+    if buy_votes >= min_votes:
+        return "BUY", round(buy_votes / total * 100, 1), None
+    if sell_votes >= min_votes:
+        return "SELL", round(sell_votes / total * 100, 1), None
+        
+    return "NO TRADE", round(max(buy_votes, sell_votes) / total * 100, 1), "Awaiting confluence entry criteria."
+
+
+def fetch_candles(symbol=SYMBOL, period=DEFAULT_LOOKBACK, interval=DEFAULT_CANDLE_INTERVAL) -> pd.DataFrame:
+    if yf is None:
+        raise RuntimeError("yfinance package missing. Install via: pip install yfinance")
+    df = yf.download(symbol, period=period, interval=interval, progress=False)
+    if df.empty:
+        raise RuntimeError("Empty data packet received from network feed.")
+        
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.droplevel(1)
+        
+    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+    df = df.rename(columns=str.lower)
+    return df.dropna()
+
+
+# ----------------------------- Engine Thread -----------------------------
+
+class SignalWorker(threading.Thread):
+    def __init__(self, result_queue: queue.Queue, get_settings_fn):
+        super().__init__(daemon=True)
+        self.result_queue = result_queue
+        self.get_settings = get_settings_fn
+        self._stop_event = threading.Event()
+
+    def stop(self):
+        self._stop_event.set()
+
+    def run(self):
+        while not self._stop_event.is_set():
+            settings = self.get_settings()
+            try:
+                df = fetch_candles(
+                    symbol=settings["symbol"],
+                    period=DEFAULT_LOOKBACK,
+                    interval=settings["candle_interval"],
+                )
+                votes = generate_votes(df)
+                regime = classify_regime(df)
+                signal, confidence, note = aggregate_signal(votes, regime, settings["min_votes"])
+                price = float(df["close"].iloc[-1])
+                ts_str = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+
+                self.result_queue.put({
+                    "type": "update",
+                    "symbol": settings["symbol"],
+                    "pair_label": settings["pair_label"],
+                    "price": price,
+                    "timestamp": ts_str,
+                    "regime": regime,
+                    "votes": votes,
+                    "signal": signal,
+                    "confidence": confidence,
+                    "note": note,
+                })
+            except Exception as e:
+                self.result_queue.put({"type": "error", "message": str(e)})
+
+            # Sleeps systematically for 180 seconds (3 minutes) before running another market check
+            self._stop_event.wait(settings["poll_seconds"])
+
+
+# ------------------------------- GUI -------------------------------
+
+SIGNAL_COLORS = {
+    "BUY": "#1fae5f",
+    "SELL": "#d1453b",
+    "NO TRADE": "#8a8f98",
+}
+
+
+class SignalBotGUI:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title(f"{DEFAULT_PAIR_LABEL} 3-Min Alert Bot")
+        self.root.geometry("560x700")
+        self.root.configure(bg="#12141a")
+
+        self.result_queue = queue.Queue()
+        self.worker = None
+
+        self._build_style()
+        self._build_widgets()
+        self._poll_queue()
+
+    def _build_style(self):
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("TFrame", background="#12141a")
+        style.configure("TLabel", background="#12141a", foreground="#e6e8eb", font=("Segoe UI", 10))
+        style.configure("Header.TLabel", font=("Segoe UI", 15, "bold"), foreground="#ffffff")
+        style.configure("Sub.TLabel", font=("Segoe UI", 9), foreground="#9aa0aa")
+        style.configure("TButton", font=("Segoe UI", 10, "bold"), padding=5)
+
+    def _build_widgets(self):
+        pad = {"padx": 14, "pady": 6}
+
+        header = ttk.Frame(self.root)
+        header.pack(fill="x", **pad)
+        self.header_label = ttk.Label(header, text=f"{DEFAULT_PAIR_LABEL} 3-Min Execution Bot", style="Header.TLabel")
+        self.header_label.pack(anchor="w")
+
+        # --- Settings Panel ---
+        settings = ttk.Frame(self.root)
+        settings.pack(fill="x", **pad)
+        
+        ttk.Label(settings, text="Asset Pair:").grid(row=0, column=0, sticky="w")
+        self.pair_var = tk.StringVar(value=DEFAULT_PAIR_LABEL)
+        pair_box = ttk.Combobox(settings, textvariable=self.pair_var, width=10, values=list(PAIRS.keys()), state="readonly")
+        pair_box.grid(row=0, column=1, padx=(4, 16))
+        pair_box.bind("<<ComboboxSelected>>", self.on_pair_change)
+
+        ttk.Label(settings, text="Candle Basis:").grid(row=0, column=2, sticky="w")
+        self.candle_var = tk.StringVar(value=DEFAULT_CANDLE_INTERVAL)
+        candle_box = ttk.Combobox(settings, textvariable=self.candle_var, width=6, values=["1m", "5m"], state="readonly")
+        candle_box.grid(row=0, column=3, padx=(4, 16))
+
+        ttk.Label(settings, text="Pacing:").grid(row=0, column=4, sticky="w")
+        self.poll_var = tk.StringVar(value=str(DEFAULT_POLL_SECONDS))
+        ttk.Entry(settings, textvariable=self.poll_var, width=5, state="readonly").grid(row=0, column=5, padx=(4, 0))
+
+        # --- Dashboard Actions ---
+        controls = ttk.Frame(self.root)
+        controls.pack(fill="x", **pad)
+        self.start_btn = ttk.Button(controls, text="▶ Start Pacing Engine", command=self.start)
+        self.start_btn.pack(side="left")
+        self.stop_btn = ttk.Button(controls, text="■ Stop", command=self.stop, state="disabled")
+        self.stop_btn.pack(side="left", padx=(8, 0))
+        self.status_label = ttk.Label(controls, text="Inactive", style="Sub.TLabel")
+        self.status_label.pack(side="left", padx=(16, 0))
+
+        # --- Data Metrics ---
+        info = ttk.Frame(self.root)
+        info.pack(fill="x", **pad)
+        self.price_label = ttk.Label(info, text="Price: —", font=("Segoe UI", 12, "bold"))
+        self.price_label.pack(anchor="w")
+        self.time_label = ttk.Label(info, text="Last evaluation: —", style="Sub.TLabel")
+        self.time_label.pack(anchor="w")
+
+        # --- PRIMARY TRIGGER PANEL ---
+        alert_frame = tk.LabelFrame(self.root, text=" 3-MINUTE TRADING WINDOW ALERT ", bg="#171a21", fg="#ffffff", font=("Segoe UI", 10, "bold"), padx=10, pady=10)
+        alert_frame.pack(fill="x", padx=14, pady=10)
+        
+        self.action_label = tk.Label(
+            alert_frame, text="ENGINE WAITING INITIATION", font=("Segoe UI", 22, "bold"),
+            bg="#171a21", fg="#8a8f98"
+        )
+        self.action_label.pack(pady=5)
+        
+        self.instruction_label = tk.Label(
+            alert_frame, text="Updates execute precisely every 180s using clean data streams.", font=("Segoe UI", 10, "italic"),
+            bg="#171a21", fg="#9aa0aa"
+        )
+        self.instruction_label.pack()
+
+        # --- Confluence Parameters ---
+        votes_frame = ttk.Frame(self.root)
+        votes_frame.pack(fill="x", **pad)
+        ttk.Label(votes_frame, text="Current Candle Technical Indicators Matrix", style="Sub.TLabel").pack(anchor="w")
+        self.vote_labels = {}
+        vote_grid = ttk.Frame(votes_frame)
+        vote_grid.pack(fill="x", pady=(4, 0))
+        for i, name in enumerate(["EMA_Cross", "RSI", "MACD", "Bollinger", "Stochastic"]):
+            row = ttk.Frame(vote_grid)
+            row.grid(row=i, column=0, sticky="ew", pady=2)
+            ttk.Label(row, text=name, width=16).pack(side="left")
+            lbl = tk.Label(row, text="—", bg="#12141a", fg="#e6e8eb", font=("Segoe UI", 10, "bold"))
+            lbl.pack(side="left")
+            self.vote_labels[name] = lbl
+
+        # --- Log Console ---
+        ttk.Label(self.root, text="3-Minute Strategy Log History", style="Sub.TLabel").pack(anchor="w", padx=14)
+        log_frame = ttk.Frame(self.root)
+        log_frame.pack(fill="both", expand=True, padx=14, pady=(4, 14))
+        self.log_text = tk.Text(log_frame, height=6, bg="#0c0e12", fg="#c9cdd3", font=("Consolas", 9), relief="flat")
+        self.log_text.pack(fill="both", expand=True, side="left")
+        scrollbar = ttk.Scrollbar(log_frame, command=self.log_text.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.log_text.configure(yscrollcommand=scrollbar.set, state="disabled")
+
+    def get_settings(self):
+        pair_label = self.pair_var.get()
+        return {
+            "symbol": PAIRS.get(pair_label, SYMBOL),
+            "pair_label": pair_label,
+            "candle_interval": self.candle_var.get(),
+            "poll_seconds": DEFAULT_POLL_SECONDS,
+            "min_votes": MIN_VOTES,
+        }
+
+    def on_pair_change(self, event=None):
+        pair_label = self.pair_var.get()
+        self.header_label.configure(text=f"{pair_label} 3-Min Execution Bot")
+        self.price_label.configure(text="Price: —")
+        self.time_label.configure(text="Last evaluation: —")
+        self.action_label.configure(text="WAITING FOR 3-MIN WINDOW", fg="#8a8f98")
+        for lbl in self.vote_labels.values():
+            lbl.configure(text="—", fg="#e6e8eb")
+        self._append_log(f"Realigned asset vector selection towards: {pair_label}.")
+
+    def start(self):
+        if self.worker and self.worker.is_alive():
+            return
+        self.worker = SignalWorker(self.result_queue, self.get_settings)
+        self.worker.start()
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.status_label.configure(text="Pacing Engine Running (3m)…")
+        self._append_log("Pacing process engaged. Running baseline fetch sequence...")
+
+    def stop(self):
+        if self.worker:
+            self.worker.stop()
+        self.start_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.status_label.configure(text="Inactive")
+        self._append_log("Pacing process suspended.")
+
+    def _poll_queue(self):
+        try:
+            while True:
+                item = self.result_queue.get_nowait()
+                if item["type"] == "update":
+                    self._apply_update(item)
+                elif item["type"] == "error":
+                    self.status_label.configure(text=f"Sync Disrupted: {item['message'][:30]}")
+                    self._append_log(f"Sync Error: {item['message']}")
+        except queue.Empty:
+            pass
+        self.root.after(300, self._poll_queue)
+
+    def _apply_update(self, item):
+        pair_label = item.get("pair_label", self.pair_var.get())
+        self.price_label.configure(text=f"{pair_label} Spot Index: {item['price']:.5f}")
+        self.time_label.configure(text=f"Last evaluation: {item['timestamp']}")
+        self.status_label.configure(text="Pacing Engine Running (3m)…")
+
+        for name, lbl in self.vote_labels.items():
+            v = item["votes"].get(name, "—")
+            color = {"BUY": "#1fae5f", "SELL": "#d1453b", "NEUTRAL": "#9aa0aa"}.get(v, "#e6e8eb")
+            lbl.configure(text=v, fg=color)
+
+        signal = item["signal"]
+        
+        if signal in ["BUY", "SELL"]:
+            # Set the exact action command text
+            self.action_label.configure(text=f"EXECUTE {signal} NOW", fg=SIGNAL_COLORS[signal])
+            
+            # Explicit clear entry commands
+            execution_details = f"Open {signal} for {pair_label} @ {item['price']:.5f} ({item['confidence']}% confluence)"
+            self.instruction_label.configure(text=execution_details, fg="#ffffff")
+            
+            # Trigger window audio bell chime to request quick trader focus
+            self.root.bell()
+            
+            log_msg = f"[{item['timestamp']}] 🚨 ACTION SIGNAL: {signal} on {pair_label} near {item['price']:.5f}"
+            self._append_log(log_msg)
+        else:
+            self.action_label.configure(text="NO TRADE WINDOW", fg="#8a8f98")
+            if item["note"]:
+                self.instruction_label.configure(text=f"Window Result: {item['note']}", fg="#9aa0aa")
+
+    def _append_log(self, line: str):
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", line + "\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+
+# ----------------------------- Execution Entry Point -----------------------------
+
+def main():
+    root = tk.Tk()
+    app = SignalBotGUI(root)
+
+    def on_close():
+        if app.worker:
+            app.worker.stop()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        if app.worker:
+            app.worker.stop()
+
+
+if __name__ == "__main__":
+    main()
